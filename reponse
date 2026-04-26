@@ -1,0 +1,128 @@
+這個範例會將我們討論的 Java 18 Record、Spring AOP、以及 SpEL 動態解析 全部串聯起來。
+
+我們將模擬一個完整的流程：從 Index API 取得路徑，到 S3 API 下載 Log。
+
+1. 定義資料結構 (Records) 與註解
+利用 Java 18 的 record 讓程式碼最簡化。
+
+Java
+// 1. 自定義註解
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+@interface ApiMonitor {
+    String value() default ""; // API 名稱
+    String key() default "";   // SpEL 表達式抓取 EQPID
+}
+
+// 2. 資料載體
+record LogPathResponse(String eqpId, String logPath) {}
+record S3Request(String eqpId, String fullS3Url) {}
+2. AOP 切面實作 (通用計時器)
+這段代碼就是你剛才看的那段「萬用翻譯官」。
+
+Java
+@Aspect
+@Component
+class ApiPerformanceAspect {
+    private final ExpressionParser parser = new SpelExpressionParser();
+    private final DefaultParameterNameDiscoverer nameDiscoverer = new DefaultParameterNameDiscoverer();
+
+    @Around("@annotation(apiMonitor)")
+    public Object trackTime(ProceedingJoinPoint joinPoint, ApiMonitor apiMonitor) throws Throwable {
+        long start = System.currentTimeMillis();
+        try {
+            return joinPoint.proceed();
+        } finally {
+            long duration = System.currentTimeMillis() - start;
+            String eqpId = parseSpel(joinPoint, apiMonitor.key());
+            System.out.printf("[PERF-LOG] 步驟: %-10s | EQP: %-8s | 耗時: %d ms%n", 
+                apiMonitor.value(), eqpId, duration);
+        }
+    }
+
+    private String parseSpel(ProceedingJoinPoint joinPoint, String expression) {
+        if (expression.isBlank()) return "N/A";
+        try {
+            MethodSignature method = (MethodSignature) joinPoint.getSignature();
+            EvaluationContext context = new StandardEvaluationContext();
+            String[] params = nameDiscoverer.getParameterNames(method.getMethod());
+            Object[] args = joinPoint.getArgs();
+            for (int i = 0; i < args.length; i++) {
+                context.setVariable(params[i], args[i]);
+            }
+            return parser.parseExpression(expression).getValue(context, String.class);
+        } catch (Exception e) { return "Unknown"; }
+    }
+}
+3. 業務邏輯實作 (Service)
+這裡展示如何針對兩個不同的 API 帶入不同的變數位置。
+
+Java
+@Service
+public class LogIntegrationService {
+
+    // 第一階段：打 Index API
+    // 這裡 key = "#eqpId" 是直接抓取方法參數
+    @ApiMonitor(value = "Index_API", key = "#eqpId")
+    public List<LogPathResponse> getLogPathsFromIndex(String eqpId, String startTime) {
+        // 模擬網路延遲
+        sleep(100); 
+        return List.of(
+            new LogPathResponse(eqpId, "/logs/2026/04/part1.log"),
+            new LogPathResponse(eqpId, "/logs/2026/04/part2.log")
+        );
+    }
+
+    // 第二階段：打 S3 API
+    // 這裡 key = "#request.eqpId" 是從物件 DTO 裡面挖資料
+    @ApiMonitor(value = "S3_API", key = "#request.eqpId")
+    public String downloadFromS3(S3Request request) {
+        // 模擬 S3 下載大檔案的延遲
+        sleep(300); 
+        return "Log Content from " + request.fullS3Url();
+    }
+
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException ignored) {}
+    }
+}
+4. 流程發動機 (Controller/Runner)
+最後是整合成一條線的地方。
+
+Java
+@Component
+public class LogWorkflow {
+    @Autowired private LogIntegrationService service;
+
+    public void runWorkflow(String eqpId) {
+        // 1. 取得路徑
+        List<LogPathResponse> paths = service.getLogPathsFromIndex(eqpId, "2026-04-26 12:00:00");
+
+        // 2. 遍歷並處理每一筆 (10個物件)
+        for (LogPathResponse res : paths) {
+            String fullUrl = "s3://my-bucket" + res.logPath();
+            S3Request s3Req = new S3Request(res.eqpId(), fullUrl);
+            
+            // 3. 下載並自動計時
+            String content = service.downloadFromS3(s3Req);
+            System.out.println("處理完成: " + res.logPath());
+        }
+    }
+}
+💡 執行後的 Log 會長這樣：
+當你執行 runWorkflow("EQP-001")，控制台會自動噴出：
+
+Plaintext
+[PERF-LOG] 步驟: Index_API  | EQP: EQP-001  | 耗時: 105 ms
+[PERF-LOG] 步驟: S3_API     | EQP: EQP-001  | 耗時: 302 ms
+處理完成: /logs/2026/04/part1.log
+[PERF-LOG] 步驟: S3_API     | EQP: EQP-001  | 耗時: 310 ms
+處理完成: /logs/2026/04/part2.log
+為什麼這是一個「好」範例？
+解耦：你的 LogIntegrationService 裡面沒有任何一行計時或印 Log 的程式碼，它只負責邏輯。
+
+彈性：ApiPerformanceAspect 是一次寫好，終身受用。無論你是傳單一字串還是傳整個 Request 物件，SpEL 都能幫你處理。
+
+可讀性：利用 Java 18 的 record，即便處理 10 個 50KB 的 JSON，程式碼依然非常清爽且高效。
+
+你在實作時，這二個 API 之間還需要做什麼特別的欄位轉換嗎？（例如要把時間格式改掉之類的）
